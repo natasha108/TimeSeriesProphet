@@ -1,0 +1,477 @@
+---
+title: "Forecasting with Prophet"
+author: "Natasha Sing"
+date: "12/16/2021"
+output: rmdformats::readthedown
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo=FALSE,
+  warning=FALSE,
+  message=FALSE,
+  fig.width = 12,
+  fig.height = 6,
+  fig.pos="H")
+```
+
+```{r echo=FALSE}
+library(knitr)
+library(kableExtra)
+library(DT)
+library(htmltools)
+library(tidyr)
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(cowplot)
+library(prophet)
+library(lubridate)
+library(naniar)
+library(VIM)
+library(here)
+library(imputeTS)
+
+# Load the data
+
+sales_raw <- read_csv(here("training_Sales.csv"))
+traffic_raw <- read_csv(here("training_Traffic.csv"))
+
+
+# Exploratory data analysis
+sales_summary <-summary(sales_raw)
+traffic_summary <- summary(traffic_raw)
+
+# Remove outlier from sales as it will affect data imputation methods.
+sales_out <- subset(sales_raw, sales_raw$Value > 0 & sales_raw$Value < max(sales_raw$Value))
+sales_out_summary <-summary(sales_out)
+```
+
+# Analysis Context
+The customer required to identify the sales and traffic per hour for the following month.
+The data provided was Sales and Traffic values for specific time intervals.
+I have approached this problem by using the time series modeling technique as the data is time dependent.
+While it can be the case that traffic per hour can be used as an explanatory variable to predict sales, I have modeled each Sales and Traffic as a univariate analysis to keep it simple.
+
+
+# Descriptive Statistics
+
+Before we choose any model, it is best that we understand the data structure and conduct some exploratory analysis.
+<body>
+  <h3>Observations:</h3>
+    <ul>
+      <li>Both the Sales and Traffic data sets are captured in 15 min intervals</li>
+      <li>Sales data has been captured from 11 November 2013 to 6 May 2018 with an average mean sales of 815.7 cents </li>
+      <li>Traffic data has been collected for a slightly shorter time 1 January 2015 to 6 May 2018 of 4 people  </li>
+      <li>There is a max value in Sales of 6435 which appears to  be an outlier.  </li>
+    </ul>
+</body>
+
+```{r sales}
+
+print("Sales Structure")
+ head(sales_raw,10)
+
+print("Traffic_Structure")
+ head(traffic_raw,10)
+
+print("Sales Summary")
+sales_summary
+
+
+print("Traffic Summary")
+traffic_summary
+
+```
+
+
+
+# Exploratory Data Analysis
+In this section, we plot each data set to understand whether there are any trends, outliers and seasonality.
+
+The seasonality in the sales data was obscurred by the outlier of 6435 . As a result, we could faintly see little peaks around Dec/Jan.
+However, I have reduced the "y" limits on the graph to show the trend easily.
+It is evident the both data sets have an obvious seasonality around December/Jan.
+
+<br/>
+
+```{r trend, fig.align='center'}
+
+sales_trend <- ggplot(sales_raw %>% filter(Date >='2015-01-01') , aes(y = Value, x = Date)) +
+  geom_line() +
+ ylim(1,1500)+
+ggtitle("Sales") 
+
+# Looks like the December/Jan period is the busiest. Obvious seasonality
+traffic_trend <- ggplot(traffic_raw %>% filter(Date >='2015-01-01'), aes(y = Value, x = Date)) +
+  geom_line() +
+  ggtitle("Traffic")
+
+plot_grid(sales_trend, traffic_trend, nrow=2)
+```
+<br/>
+
+# Handling Missing Data
+It is always better to zoom into the data to observe whether there are any missing values. Thanks for the hint!
+What is perculiar with both sets of data is that there are actual time intervals missing as showned in the graphs below.
+
+<br/>
+
+```{r missing, fig.align='center'}
+sales_trend <- ggplot(sales_raw %>% filter(Date >='2018-05-01') , aes(y = Value, x = Date)) +
+  geom_line() +
+  ylim(1,1500)
+
+# Looks like the December/Jan period is the busiest. Obvious seasonality
+traffic_trend <- ggplot(traffic_raw %>% filter(Date >='2018-05-01'), aes(y = Value, x = Date)) +
+  geom_line()
+plot_grid(sales_trend, traffic_trend, nrow=2)
+```
+<br/>
+
+## Approach
+Each missing time interval will need to be inserted to create a full time sequence.
+I have handled this bycreating a smooth time sequence based on 15 minute intervals from the start and end times of both datasets.
+Both the Sales and Traffic dataset had to be "full-joined" to the smooth time sequence. 
+
+```{r}
+#Insert missing time gaps with full sequence of time based on a certain time interval
+insert_timegap <- function(data, Date,interval) {
+  
+  time_sequence <- seq.POSIXt(as.POSIXct(min(data$Date)), as.POSIXct(max(data$Date)), by=interval) 
+  time_sequence <- data.frame(Date = time_sequence)
+  full_join(time_sequence,data)
+  
+}
+
+sales_missing <- insert_timegap(sales_out,Date, 900)
+traffic_missing <- insert_timegap(traffic_raw,Date, 900)
+```
+
+
+This resulted in the newly inserted time intervals to have "NA" values for both the Sales and Traffic values.
+The plot below shows that there has been numerous time interval with missing values.
+
+<br/>
+
+ ```{r timegaps, fig.align='center'}
+
+ggplot_na_distribution((sales_missing %>% filter(Date >='2018-05-01'))$Value,title = "Sales Missing Value Distribution",x_axis_labels = (sales_missing %>% filter(Date >='2018-05-01'))$Date)
+ggplot_na_distribution((traffic_missing %>% filter(Date >='2018-05-01'))$Value,title = "Traffic Missing Value Distribution", x_axis_labels = (traffic_missing %>% filter(Date >='2018-05-01'))$Date)
+ 
+ ```
+<br/>
+
+The following summary helps us understand the extent of the missing values.
+More than 50% of both Traffic and Sales have missing values which is not ideal. 
+Not only are there huge gaps in the data but it can be seen from below there has been long consecutive gaps of "NAs"
+This evidence is very useful when deciding how to cater for this values.
+
+
+
+**Sales Missing Value Summary**
+```{r miss_sales}
+statsNA(sales_missing$Value)
+```
+
+
+**Traffic Missing Value Summary**
+```{r miss_traffic}
+statsNA(traffic_missing$Value)
+```
+
+## Data Imputation
+We have seen that we need to deal with a  huge amount of missing values. Essentially, we would need to replace/impute the "NAs" with a reasonable value.
+Initially, I imputed the missing values with the "mean". This didn't work too well as it didn't capture the seasonal points of the data and the gaps in the data was consecutively huge. 
+
+Consequently, I have used the method of "Simple Moving Average" with a window of 10 values prior and post to the missing value as a data imputation technique. This approach probably better for time series modeling especially as it could cater for seasonal trends in the data.
+I had to remove the outlier values of 6435 in the Sales data as it was inflating the moving averages.
+
+```{r}
+#Identify and Impute  NA values  moving average imputation
+impute_values <- function(data)
+  
+{
+  
+  data <- data %>% mutate(MissingValue = ifelse(is.na(Value),1,0))
+  
+  na_ma(data, k =10, weighting = "simple")
+  
+}
+
+
+#Impute NA values 
+sales_imputed <- impute_values(sales_missing)
+traffic_imputed <- impute_values(traffic_missing)
+
+Imputation <- c(" Sales Before", "Sales After", "Traffic Before", "Traffic After")
+Mean <- c(mean(sales_raw$Value, na.rm = TRUE), mean(sales_imputed$Value), mean(traffic_raw$Value, na.rm = TRUE), mean(traffic_imputed$Value))
+Details <- data.frame(Imputation, Mean)
+```
+
+
+The summary below shows that the mean of each data set is much lower after the imputation.
+
+```{r imputemeans}
+kable(Details,format="html" ,escape =FALSE) %>%
+    kable_styling(full_width = T) %>%
+    column_spec(1,bold =T,)%>%
+    row_spec(0,color ="blue")
+```
+
+# Creating the Time Series Model
+The time series model chosen is Facebook's Prophet model.
+Both our dataset are non-linear with seasonality and holiday effects. 
+Prophet model is well suited in this respect and also very robust without too much fine tuning.
+
+Before we apply the model, we need to transform our data into an hourly data stamp. This is because we are predicting the values for a month forward per hour.
+
+A holiday dataframe to capture "Christmas day" with a window of 7 days before and after Christmas. All dates during this period will  be considered as the holiday effect. 
+I would have considered more "holiday" periods but it seemed that the Christmas period is quite significant with the 7 days window.
+
+## Holidays
+
+```{r holiday}
+# Aggregate data per hour
+hourly <- function(data){
+  
+  data <- data %>% mutate(Date = floor_date(Date,"hour")) %>%
+    group_by(Date) %>%
+    summarize (Value = sum(Value, na.rm = TRUE))
+}
+
+  
+  
+sales <- hourly(sales_imputed)
+traffic <- hourly(traffic_imputed)
+
+
+# Build prophet model on Sales data
+sales <- sales %>% select(ds = Date, y= Value)
+traffic <- traffic %>% select(ds = Date, y= Value)
+
+
+# Create "Holiday" Affect
+holidays <- data.frame(holiday = "christmas_day",
+           ds =c(seq.POSIXt(as.POSIXct('2013-12-25'), length.out = 24,by=3600),
+                 seq.POSIXt(as.POSIXct('2014-12-25'), length.out = 24,by=3600),
+                 seq.POSIXt(as.POSIXct('2015-12-25'), length.out = 24,by=3600),
+                 seq.POSIXt(as.POSIXct('2016-12-25'), length.out = 24,by=3600),
+                 seq.POSIXt(as.POSIXct('2017-12-25'), length.out = 24,by=3600),
+                 seq.POSIXt(as.POSIXct('2018-12-25'), length.out = 24,by=3600)),
+               lower_window = -7,
+   
+                       upper_window = +7 )
+head(holidays)
+
+```
+<br/>
+The model for Sales and Traffic is based is created as follows :
+Prophet uses the fourier series to capture seasonality.  
+The three seasonality parameters have been set on a high order on the fourier series to cater for the peaks in both datasets oscillations.
+
+ prophet(yearly.seasonality = 20,
+          weekly.seasonality = 20,
+          daily.seasonality = 20,
+          interval.width = 0.95
+          )
+<br/>
+
+
+```{r createmodel}
+# Instantiate a Sales prophet model               
+prophet.init <- function(year, week, day, interval) {
+  
+  prophet(yearly.seasonality = year,
+          weekly.seasonality = week,
+          daily.seasonality = day,
+          interval.width = interval
+          )
+}
+
+# Increased fourier series on seasonalitys to 20 to capture the peaks in the data.
+sales_prophet <- prophet.init(20,20,20,0.95)
+traffic_prophet <- prophet.init(20,20,20,0.95)
+
+
+#Build a model for "holiday" effect
+sales_prophet <- prophet(holidays = holidays)
+traffic_prophet <- prophet(holidays = holidays)
+
+#Fit the model to the data
+sales_prophet_fit <- fit.prophet(sales_prophet,sales)
+traffic_prophet_fit <- fit.prophet(traffic_prophet,traffic)
+
+```
+## Making Predicions
+The prophet model has predicted daily per hourly going forward 12 months. I have increased the horizon of the prediction period to see how well the model handles seasonality. We are aware that the customer only needs next months data.
+
+Both models have captured the seasonality in the data. However, I would have hoped for it to capture the peaks a little more better.
+
+
+```{r futuredf}
+#Lets predict daily per hour going forward 12 months
+sales_future <- make_future_dataframe(sales_prophet_fit, periods = 12 * 30 * 24, freq = 60*60)
+traffic_future <- make_future_dataframe(traffic_prophet_fit, periods = 12 * 30 * 24, freq = 60*60)
+traffic_future$floor <- 0
+
+#Predict future values using the prophet model
+sales_predict <- predict(sales_prophet_fit,sales_future)
+traffic_predict <- predict(traffic_prophet_fit,traffic_future)
+```
+
+
+**Sales Forecasted Values**
+```{r plot_sales_for}
+
+plot(sales_prophet_fit,sales_predict)
+
+```
+
+**Traffic Forecasted Values**
+```{r plot_traffic_for}
+plot(traffic_prophet_fit, traffic_predict)
+```
+
+
+## Seasonality
+
+Here we look at the model components
+There is now a component of holidays that neatly picks out the peaks with those special days.
+The model also captures the yearly seasonality which is around the Christmas period.
+In terms of the weekly seasonality it can also be seen that Wednesday to Thursdays are the least sales.
+However, in the traffic data, weekday in general is quieter.
+The daily seasonality shows that from 12pm to mid afternoon are when we get most sales and shoppers.
+Interestingly, these conclusions apply to both graphs.
+
+**Sales Prophet Component**
+```{r salescomp}
+prophet_plot_components(sales_prophet_fit, sales_predict)
+```
+
+**Traffic Prophet Component**
+```{r trafficcomp}
+prophet_plot_components(traffic_prophet_fit, traffic_predict)
+```
+
+## Forecasted Results
+
+Here we forecast the values for the month ahead which is June 2018 for both Traffic and Sales
+```{r predict}
+#Extract predicted values
+sales_forecast <- sales_predict[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')]
+traffic_forecast <- traffic_predict[c('ds', 'yhat', 'yhat_lower', 'yhat_upper')]
+
+# Compare observed and predict values. See where the major differences occur?
+compared_sales <-  left_join(sales_predict,sales, by = "ds" ) %>% mutate(Diff = y - yhat)
+compared_traffic <-  left_join(traffic_predict, sales, by = "ds" ) %>% mutate(Diff = y - yhat)
+```
+
+**Sales Forecasted values**
+
+```{r DTsales}
+
+datatable(sales_forecast %>% filter(ds >= '2018-06-01' & ds <= '2018-06-30'), rownames = FALSE,options = list(searching = FALSE)) %>%
+   formatRound(2:4,digits = 2, interval =3,mark =",") 
+
+```
+
+**Traffic Forecasted values**
+
+The traffic values show small negative values due to the vast amount of zeros in the data.
+```{r DTtraffic}
+
+datatable(traffic_forecast %>% filter(ds >= '2018-06-01' & ds <= '2018-06-30'), rownames = FALSE,options = list(searching = FALSE))  %>%
+   formatRound(2:4,digits = 2, interval =3,mark =",") 
+
+```
+
+
+## Diagnostics
+Now that we have built our model, lets assess how good the model is. Prophet provides an easy way to assess how well the model performs via cross_validation() method.
+
+  <h3>The cross_validation() works as follows :</h3>
+    <ul>
+      <li>Choose the first initial sample as a training set</li>
+      <li> Fit the model </li>
+      <li>Use the  model to forecast a horizon interval </li>
+      <li>The training cutoff is then shifted forward by the period samples and the process is repeated.  </li>
+    </ul>
+</body>
+In this way, you have a training and testing test to evaluate your model.
+
+```{r crossv}
+sales_cv <- cross_validation(sales_prophet_fit ,
+                                              initial =20000, # 51% training set
+                                              period = 2160, # 3month period
+                                              horizon = 30 * 24 *2, #forecasting 2 months forward
+                                              units = "hours")
+
+traffic_cv <- cross_validation(traffic_prophet_fit ,
+                             initial =24000, # 80% training set
+                             period = 2160, #3 month period
+                             horizon = 30 * 24 *2, # forecasting 2 months forward
+                             units = "hours")
+
+```
+
+The results contain predictions for a selection of cutoff dates. Each record contains the predicted and observed values for a particular date and cutoff.
+
+**Sales**
+```{r}
+head(sales_cv)
+```
+
+**Traffic**
+```{r}
+head(traffic_cv)
+```
+
+These data can be summarised using the performance_metrics() method.
+```{r metric}
+
+print("Sales Performance")
+
+sales_metrics <- performance_metrics(sales_cv)
+
+head(sales_metrics)
+
+print("TrafficPerformance")
+
+traffic_metrics <- performance_metrics(traffic_cv)
+
+head(traffic_metrics)
+```
+
+We are now able to visualize the average performance of the model as a function of the forecast horizon
+Here we look at the MAE (Mean Absolute Error). The smaller the MAE the better the model.
+
+This model has performed fairly ok.
+
+```{r maeplot}
+
+print("Sales MAE")
+
+plot_cross_validation_metric(sales_cv,metric='mae')
+
+print("Traffic MAE")
+plot_cross_validation_metric(traffic_cv,metric='mae')
+
+```
+
+## Conclusion
+It is always good to look back in hindsight to see how you could have done the same model differently the next time.
+
+  <h3>Possible Improvements :</h3>
+    <ul>
+      <li>Merge Sales and Traffic datasets to deal with just one master dataframe. </li>
+      <li>Use bayesian approach to missing data imputation. The high error between predicted and observed resulted from missing values. </li>
+      <li> Perhaps use the logistic regression growth curve trend. </li>
+      <li>Possibly use Traffic data as regressor for Sales in the model similar to a Multivariate Analysis. As traffic increases the sales value is most          likely to increase. <li>
+   </ul>
+   
+Thank you for affording me this opportunity to build these models. It was great fun.   
+</body>
+
+
+
